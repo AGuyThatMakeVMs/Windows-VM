@@ -1,0 +1,129 @@
+name: Windows VM
+
+# Versão enxuta para disparar pelo app do GitHub no celular.
+# Só o ENDEREÇO (ID do AnyDesk) aparece. Você digita a senha ao iniciar; ela é mascarada nos logs.
+# Não usa secrets. Use em repositório PRIVADO (o ID aparece nos logs e no resumo da execução).
+
+on:
+  workflow_dispatch:
+    inputs:
+      senha:
+        description: 'Senha do AnyDesk (mínimo 8 caracteres)'
+        type: string
+        required: true
+      duracao_minutos:
+        description: 'Tempo ligada (minutos)'
+        type: choice
+        options:
+          - '60'
+          - '120'
+          - '240'
+          - '340'
+        default: '240'
+      roblox_studio:
+        description: 'Abrir o Roblox Studio'
+        type: boolean
+        default: true
+
+jobs:
+  vm:
+    runs-on: windows-latest
+    timeout-minutes: 355
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Validar senha
+        env:
+          SENHA: ${{ inputs.senha }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SENHA) -or $env:SENHA.Length -lt 8) {
+            Write-Error 'A senha precisa ter no mínimo 8 caracteres.'
+            exit 1
+          }
+          Write-Host "::add-mask::$($env:SENHA)"
+
+      - name: Otimizar o Windows
+        run: |
+          powercfg /setactive SCHEME_MIN
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
+
+          foreach ($svc in 'WSearch','SysMain','DiagTrack','wuauserv','MapsBroker','Fax') {
+            try {
+              Stop-Service $svc -Force -ErrorAction SilentlyContinue
+              Set-Service $svc -StartupType Disabled -ErrorAction SilentlyContinue
+            } catch {}
+          }
+
+          try { Set-MpPreference -DisableRealtimeMonitoring $true } catch {}
+
+          $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects'
+          New-Item -Path $k -Force | Out-Null
+          Set-ItemProperty -Path $k -Name VisualFXSetting -Value 2
+          Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name MenuShowDelay -Value 0
+          Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop\WindowMetrics' -Name MinAnimate -Value 0
+
+          Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+
+      - name: Instalar e configurar AnyDesk
+        env:
+          SENHA: ${{ inputs.senha }}
+        run: |
+          $dir = 'C:\AnyDesk'
+          $exe = "$dir\AnyDesk.exe"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Invoke-WebRequest 'https://download.anydesk.com/AnyDesk.exe' -OutFile $exe
+
+          Start-Process $exe -ArgumentList "--install `"$dir`" --start-with-win --silent" -Wait
+          Start-Sleep -Seconds 8
+          Start-Process $exe
+          Start-Sleep -Seconds 8
+
+          $env:SENHA | & $exe --set-password
+
+          $id = ''
+          for ($i = 0; $i -lt 15 -and $id -notmatch '^\d{6,}$'; $i++) {
+            $id = (& $exe --get-id | Out-String).Trim()
+            if ($id -notmatch '^\d{6,}$') { Start-Sleep -Seconds 4 }
+          }
+          if ($id -notmatch '^\d{6,}$') { Write-Error 'Não consegui obter o ID do AnyDesk.'; exit 1 }
+          "ANYDESK_ID=$id" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Instalar Roblox Studio
+        if: ${{ inputs.roblox_studio }}
+        continue-on-error: true
+        run: |
+          $inst = "$env:TEMP\RobloxStudioLauncherBeta.exe"
+          Invoke-WebRequest 'https://setup.rbxcdn.com/RobloxStudioLauncherBeta.exe' -OutFile $inst
+          Start-Process $inst -ArgumentList '-silent' -Wait -ErrorAction SilentlyContinue
+
+          $studio = Get-ChildItem "$env:LOCALAPPDATA\Roblox\Versions" -Filter RobloxStudioBeta.exe -Recurse -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+          if ($studio) { Start-Process $studio.FullName }
+          else { Write-Host '::warning::Studio não instalou em modo silencioso. Instale pelo AnyDesk.' }
+
+      - name: Mostrar só o endereço
+        run: |
+          $id = $env:ANYDESK_ID
+
+          # Aparece como anotação no app do GitHub
+          Write-Host "::notice title=AnyDesk::Endereço: $id"
+          "### 🖥️ VM pronta`n**Endereço AnyDesk:** ``$id``" |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Manter a VM ligada
+        env:
+          DURACAO: ${{ inputs.duracao_minutos }}
+        run: |
+          $min = [Math]::Min([int]$env:DURACAO, 340)
+          $fim = (Get-Date).AddMinutes($min)
+          while ((Get-Date) -lt $fim) {
+            if (-not (Get-Process AnyDesk -ErrorAction SilentlyContinue)) {
+              Start-Process 'C:\AnyDesk\AnyDesk.exe'
+            }
+            Start-Sleep -Seconds 120
+          }
+          Write-Host 'Tempo esgotado, encerrando a VM.'
