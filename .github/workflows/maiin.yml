@@ -1,0 +1,157 @@
+name: Android (emulador) + AnyDesk
+
+# Sobe um Android (emulador) no GitHub Actions e libera o acesso pelo AnyDesk.
+# Só o ENDEREÇO (ID do AnyDesk) aparece. Não usa secrets: você digita a senha ao iniciar
+# (ela é mascarada nos logs, mas fica visível nos inputs da execução).
+# Use em repositório PRIVADO.
+
+on:
+  workflow_dispatch:
+    inputs:
+      senha:
+        description: 'Senha do AnyDesk (mínimo 8 caracteres)'
+        type: string
+        required: true
+      duracao_minutos:
+        description: 'Tempo ligado (minutos)'
+        type: choice
+        options:
+          - '60'
+          - '120'
+          - '240'
+          - '330'
+        default: '240'
+      android_api:
+        description: 'Versão do Android'
+        type: choice
+        options:
+          - '30'   # Android 11 (mais leve)
+          - '33'   # Android 13
+          - '34'   # Android 14
+        default: '30'
+      apk_url:
+        description: 'Link direto de um APK para instalar (opcional)'
+        type: string
+        required: false
+        default: ''
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+
+    steps:
+      - name: Validar senha
+        env:
+          SENHA: ${{ inputs.senha }}
+        run: |
+          if [ "${#SENHA}" -lt 8 ]; then
+            echo "::error::A senha precisa ter no mínimo 8 caracteres."
+            exit 1
+          fi
+          echo "::add-mask::$SENHA"
+
+      - name: Otimizar o Linux
+        run: |
+          sudo systemctl disable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer motd-news.timer 2>/dev/null || true
+          # Libera disco e memória para o emulador
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost || true
+          sudo sysctl -w vm.swappiness=10 || true
+          sync && echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null || true
+          df -h /
+
+      - name: Ativar KVM (aceleração do emulador)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Tela virtual + AnyDesk
+        env:
+          SENHA: ${{ inputs.senha }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb openbox x11-xserver-utils wget gnupg
+
+          wget -qO- https://keys.anydesk.com/repos/DEB-GPG-KEY | sudo gpg --dearmor -o /usr/share/keyrings/anydesk.gpg
+          echo "deb [signed-by=/usr/share/keyrings/anydesk.gpg] http://deb.anydesk.com/ all main" | sudo tee /etc/apt/sources.list.d/anydesk.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq anydesk
+
+          # Processos em segundo plano que sobrevivem ao fim do passo
+          export RUNNER_TRACKING_ID=""
+          setsid nohup Xvfb :0 -screen 0 720x1280x24 > /tmp/xvfb.log 2>&1 &
+          sleep 3
+          export DISPLAY=:0
+          xhost +local: || true
+          setsid nohup openbox > /tmp/openbox.log 2>&1 &
+          sleep 2
+
+          sudo systemctl restart anydesk || true
+          setsid nohup anydesk > /tmp/anydesk.log 2>&1 &
+          sleep 10
+
+          echo "$SENHA" | sudo anydesk --set-password
+
+          ID=""
+          for i in $(seq 1 15); do
+            ID=$(anydesk --get-id 2>/dev/null | tail -n1 | tr -d '[:space:]')
+            [[ "$ID" =~ ^[0-9]{6,}$ ]] && break
+            sleep 4
+          done
+          if ! [[ "$ID" =~ ^[0-9]{6,}$ ]]; then
+            echo "::error::Não consegui obter o ID do AnyDesk."
+            exit 1
+          fi
+          echo "ANYDESK_ID=$ID" >> "$GITHUB_ENV"
+
+      - name: Mostrar só o endereço
+        run: |
+          echo "::notice title=AnyDesk::Endereço: $ANYDESK_ID (o Android leva alguns minutos para ligar)"
+          {
+            echo "### 📱 Android subindo"
+            echo "**Endereço AnyDesk:** \`$ANYDESK_ID\`"
+            echo ""
+            echo "O emulador leva alguns minutos para aparecer na tela."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preparar script do Android
+        run: |
+          cat > "$RUNNER_TEMP/android-keepalive.sh" <<'EOF'
+          #!/usr/bin/env bash
+          MIN="${DURACAO:-240}"
+          [ "$MIN" -gt 330 ] && MIN=330
+
+          # Instala o APK informado, se houver
+          if [ -n "$APK_URL" ]; then
+            curl -fL -o /tmp/app.apk "$APK_URL" && adb install -r /tmp/app.apk || echo "Falha ao instalar o APK."
+          fi
+
+          END=$(( $(date +%s) + MIN * 60 ))
+          while [ "$(date +%s)" -lt "$END" ]; do
+            # Reabre o AnyDesk se fechar
+            pgrep -x anydesk > /dev/null || (DISPLAY=:0 setsid nohup anydesk > /dev/null 2>&1 &)
+            sleep 120
+          done
+          echo "Tempo esgotado, encerrando."
+          EOF
+          chmod +x "$RUNNER_TEMP/android-keepalive.sh"
+
+      - name: Iniciar o Android e manter ligado
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          DISPLAY: ':0'
+          APK_URL: ${{ inputs.apk_url }}
+          DURACAO: ${{ inputs.duracao_minutos }}
+        with:
+          api-level: ${{ inputs.android_api }}
+          arch: x86_64
+          target: google_apis
+          profile: pixel_2
+          ram-size: 4096M
+          heap-size: 512M
+          disk-size: 8192M
+          force-avd-creation: true
+          disable-animations: true
+          emulator-options: -no-snapshot -noaudio -no-boot-anim -gpu swiftshader_indirect -camera-back none -camera-front none
+          script: bash $RUNNER_TEMP/android-keepalive.sh
