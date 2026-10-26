@@ -1,0 +1,215 @@
+name: Android (emulador) + AnyDesk
+
+# Sobe um Android (emulador) no GitHub Actions e libera o acesso pelo AnyDesk.
+# Só o ENDEREÇO (ID do AnyDesk) aparece. Não usa secrets: você digita a senha ao iniciar
+# (ela é mascarada nos logs, mas fica visível nos inputs da execução).
+# Use em repositório PRIVADO.
+
+on:
+  workflow_dispatch:
+    inputs:
+      senha:
+        description: 'Senha do AnyDesk (mínimo 8 caracteres)'
+        type: string
+        required: true
+      duracao_minutos:
+        description: 'Tempo ligado (minutos)'
+        type: choice
+        options:
+          - '60'
+          - '120'
+          - '240'
+          - '330'
+        default: '240'
+      android_api:
+        description: 'Versão do Android'
+        type: choice
+        options:
+          - '30'   # Android 11 (mais leve)
+          - '33'   # Android 13
+          - '34'   # Android 14
+        default: '30'
+      apk_url:
+        description: 'Links diretos de APKs para instalar, separados por espaço (opcional)'
+        type: string
+        required: false
+        default: ''
+      pacote_app:
+        description: 'Pacote do app para abrir sozinho, ex.: com.roblox.client (opcional)'
+        type: string
+        required: false
+        default: ''
+      anti_afk:
+        description: 'Toque mínimo a cada poucos minutos (evita expulsão por inatividade)'
+        type: boolean
+        default: true
+
+jobs:
+  android:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 358
+
+    steps:
+      - name: Validar senha
+        env:
+          SENHA: ${{ inputs.senha }}
+        run: |
+          if [ "${#SENHA}" -lt 8 ]; then
+            echo "::error::A senha precisa ter no mínimo 8 caracteres."
+            exit 1
+          fi
+          echo "::add-mask::$SENHA"
+
+      - name: Otimizar o Linux
+        run: |
+          sudo systemctl disable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer motd-news.timer 2>/dev/null || true
+          # Libera disco e memória para o emulador
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost || true
+          sudo sysctl -w vm.swappiness=10 || true
+          sync && echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null || true
+          df -h /
+
+      - name: Ativar KVM (aceleração do emulador)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Tela virtual + AnyDesk
+        env:
+          SENHA: ${{ inputs.senha }}
+        run: |
+          sudo apt-get update -qq
+          # Tela virtual + bibliotecas que o emulador precisa para abrir a janela (Qt/xcb)
+          sudo apt-get install -y -qq xvfb openbox dbus-x11 x11-xserver-utils wget gnupg \
+            libxkbcommon-x11-0 libxcb-xinerama0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xkb1 libxcb-cursor0 libpulse0 libnss3 libgl1
+
+          wget -qO- https://keys.anydesk.com/repos/DEB-GPG-KEY | sudo gpg --dearmor -o /usr/share/keyrings/anydesk.gpg
+          echo "deb [signed-by=/usr/share/keyrings/anydesk.gpg] http://deb.anydesk.com/ all main" | sudo tee /etc/apt/sources.list.d/anydesk.list
+          sudo apt-get update -qq
+          # Sem -qq: se a instalação falhar, o motivo aparece no log
+          sudo apt-get install -y anydesk
+
+          # Processos em segundo plano que sobrevivem ao fim do passo
+          export RUNNER_TRACKING_ID=""
+          setsid nohup Xvfb :0 -screen 0 720x1280x24 > /tmp/xvfb.log 2>&1 &
+          for i in $(seq 1 20); do
+            [ -S /tmp/.X11-unix/X0 ] && break
+            sleep 1
+          done
+          if [ ! -S /tmp/.X11-unix/X0 ]; then
+            echo "::error::A tela virtual (Xvfb) não iniciou."
+            cat /tmp/xvfb.log
+            exit 1
+          fi
+          export DISPLAY=:0
+          xhost +local: || true
+          setsid nohup openbox > /tmp/openbox.log 2>&1 &
+          sleep 2
+
+          sudo systemctl restart anydesk || true
+          setsid nohup anydesk > /tmp/anydesk.log 2>&1 &
+          sleep 10
+
+          # Tenta definir a senha até o serviço do AnyDesk estar pronto
+          for i in $(seq 1 10); do
+            printf '%s\n' "$SENHA" | sudo anydesk --set-password > /dev/null 2>&1 && break
+            sleep 4
+          done
+
+          # "|| true" evita que o passo morra no primeiro erro (o shell roda com -e e pipefail)
+          ID=""
+          for i in $(seq 1 20); do
+            ID=$(anydesk --get-id 2>/dev/null | tail -n1 | tr -d '[:space:]' || true)
+            [[ "$ID" =~ ^[0-9]{6,}$ ]] && break
+            sleep 4
+          done
+          if ! [[ "$ID" =~ ^[0-9]{6,}$ ]]; then
+            echo "::error::Não consegui obter o ID do AnyDesk."
+            exit 1
+          fi
+          echo "ANYDESK_ID=$ID" >> "$GITHUB_ENV"
+
+      - name: Mostrar só o endereço
+        run: |
+          echo "::notice title=AnyDesk::Endereço: $ANYDESK_ID (o Android leva alguns minutos para ligar)"
+          {
+            echo "### 📱 Android subindo"
+            echo "**Endereço AnyDesk:** \`$ANYDESK_ID\`"
+            echo ""
+            echo "O emulador leva alguns minutos para aparecer na tela."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preparar script do Android
+        run: |
+          cat > "$RUNNER_TEMP/android-keepalive.sh" <<'EOF'
+          #!/usr/bin/env bash
+          MIN="${DURACAO:-240}"
+          [ "$MIN" -gt 330 ] && MIN=330
+
+          # Mantém a tela do Android sempre ligada
+          adb shell svc power stayon true || true
+          adb shell settings put system screen_off_timeout 2147483647 || true
+
+          # Instala os APKs informados (links separados por espaço)
+          for URL in $APK_URL; do
+            curl -fL -o /tmp/app.apk "$URL" && adb install -r /tmp/app.apk || echo "Falha ao instalar: $URL"
+          done
+
+          # Abre o app informado (ex.: com.roblox.client)
+          if [ -n "$PACOTE" ]; then
+            adb shell monkey -p "$PACOTE" -c android.intent.category.LAUNCHER 1 || true
+          fi
+
+          END=$(( $(date +%s) + MIN * 60 ))
+          N=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            # Reabre o AnyDesk se fechar
+            pgrep -x anydesk > /dev/null || (DISPLAY=:0 setsid nohup anydesk > /dev/null 2>&1 &)
+            sleep 120
+            N=$((N + 1))
+            # A cada ~4 min, um deslize mínimo para evitar a expulsão por inatividade
+            if [ "$ANTI_AFK" = "true" ] && [ $((N % 2)) -eq 0 ]; then
+              adb shell input swipe 540 960 560 960 150 || true
+            fi
+          done
+          echo "Tempo esgotado, encerrando."
+          EOF
+          chmod +x "$RUNNER_TEMP/android-keepalive.sh"
+
+      - name: Iniciar o Android e manter ligado
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          DISPLAY: ':0'
+          APK_URL: ${{ inputs.apk_url }}
+          PACOTE: ${{ inputs.pacote_app }}
+          ANTI_AFK: ${{ inputs.anti_afk }}
+          DURACAO: ${{ inputs.duracao_minutos }}
+        with:
+          api-level: ${{ inputs.android_api }}
+          arch: x86_64
+          target: google_apis_playstore
+          profile: pixel_2
+          ram-size: 4096M
+          heap-size: 512M
+          disk-size: 8192M
+          force-avd-creation: true
+          disable-animations: true
+          emulator-options: -no-snapshot -noaudio -no-boot-anim -gpu swiftshader_indirect -camera-back none -camera-front none
+          script: bash $RUNNER_TEMP/android-keepalive.sh
+
+      - name: Diagnóstico (só roda se algo falhar)
+        if: failure()
+        run: |
+          echo "--- processos ---"
+          ps aux | grep -E 'Xvfb|anydesk|openbox|emulator' | grep -v grep || true
+          echo "--- serviço do AnyDesk ---"
+          sudo systemctl status anydesk --no-pager 2>&1 | tail -n 20 || true
+          echo "--- log do AnyDesk ---"
+          sudo tail -n 30 /var/log/anydesk.trace 2>/dev/null || true
+          tail -n 30 /tmp/anydesk.log 2>/dev/null || true
+          echo "--- Xvfb ---"
+          tail -n 20 /tmp/xvfb.log 2>/dev/null || true
+          echo "--- KVM ---"
+          ls -l /dev/kvm || true
